@@ -1,0 +1,22 @@
+[Unit]
+Description=WeType Xfyun-style WebSocket adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=wetype-asr
+Group=wetype-asr
+WorkingDirectory=/opt/wetype-asr-gateway
+Environment=WETYPE_CONFIG=/var/lib/wetype-asr/config.json
+ExecStart=/opt/wetype-asr-gateway/.venv/bin/python -m uvicorn gateway.iat:app --host 127.0.0.1 --port 8768 --no-access-log --log-level warning --ws-max-size 1048576 --ws-max-queue 4 --limit-concurrency 12
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target

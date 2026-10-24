@@ -1,0 +1,4 @@
+# Install inside the nginx http {} context, after replacing the VM address.
+upstream wetype_backend {
+    server 192.168.122.50:8765;
+}

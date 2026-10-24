@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wetype-asr-gateway"
+version = "0.1.0"
+description = "WeType ASR deployment gateway with Xfyun-style WebSocket and a LAN operations console"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+authors = [{name = "h9647123"}]
+dependencies = ["fastapi==0.162.0", "uvicorn==0.54.0", "httpx==0.28.1", "websockets==17.3"]
+
+[tool.setuptools.packages.find]
+include = ["gateway*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:'cgi' is deprecated:DeprecationWarning"]

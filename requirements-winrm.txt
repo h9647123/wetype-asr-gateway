@@ -1,0 +1,2 @@
+# Optional, only for the root-owned VM shutdown helper; not needed by the API.
+pywinrm==0.5.0

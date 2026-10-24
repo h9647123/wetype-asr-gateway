@@ -1,0 +1,22 @@
+[Unit]
+Description=WeType ASR local operations console and legacy API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=wetype-asr
+Group=wetype-asr
+WorkingDirectory=/opt/wetype-asr-gateway
+Environment=WETYPE_DATA_DIR=/var/lib/wetype-asr
+Environment=WETYPE_CONFIG=/var/lib/wetype-asr/config.json
+ExecStart=/opt/wetype-asr-gateway/.venv/bin/python -m gateway.console
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/wetype-asr
+# NoNewPrivileges is deliberately omitted only for the optional restricted sudo helper.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Dedicated WeType ASR Windows virtual machine
+Requires=libvirtd.service
+After=libvirtd.service network-online.target
+Wants=network-online.target
+# Add RequiresMountsFor=/your/vm/storage when VM storage is on another mount.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=WETYPE_VM_NAME=wetype-asr
+ExecStart=/usr/bin/python3 /opt/wetype-asr-gateway/scripts/vm_control.py start
+ExecStop=/usr/bin/python3 /opt/wetype-asr-gateway/scripts/vm_control.py stop
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target
