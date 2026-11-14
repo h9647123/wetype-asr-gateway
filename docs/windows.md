@@ -4,6 +4,8 @@
 
 实测基线：Windows 10 Enterprise LTSC 2021、WeType 3.0.0.38、WeChatASRBridge portable v0.3.3。3.0.0.38 存在上游“版本未验证”提示；原型真实识别通过不代表以后版本兼容。
 
+**v0.2.0 的实时 `/v1` 路径需使用本项目随发行版提供的 stream-capable portable bridge 0.3.4。** 以下原上游0.3.3材料保留为整段文件识别基线，不含 `/v1/audio/stream`。升级时按 [流式适配说明](streaming.md) 备份并安装配套扩展，保持现有 WeType 版本及版本锁定，不因网关升级而重新安装输入法。
+
 ## 材料
 
 - [微信输入法官网](https://z.weixin.qq.com/)；原型安装包为 `https://download.z.weixin.qq.com/app/win/WeTypeSetup_3.0.0.38_26.exe`。保存为 `WeTypeSetup.exe`，安装脚本验证有效的 Tencent Authenticode 签名。

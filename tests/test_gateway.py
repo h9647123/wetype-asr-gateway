@@ -21,6 +21,25 @@ import pytest
 from gateway import console, iat
 
 
+def test_stream_url_uses_private_configuration_and_health_is_not_native_probe():
+    assert iat.stream_url({'upstream': 'http://vm.example:8765'}) == 'ws://vm.example:8765/v1/audio/stream'
+    assert iat.stream_url({'upstream': 'https://vm.example/base/'}) == 'wss://vm.example/base/v1/audio/stream'
+    assert iat.stream_url({'upstream': 'http://legacy.example:8765',
+                          'stream_upstream': 'https://native.example:8766'}) == 'wss://native.example:8766/v1/audio/stream'
+    assert iat.stream_url({'upstream': 'http://vm.example:8765',
+                          'stream_upstream': ''}) == 'ws://vm.example:8765/v1/audio/stream'
+    with pytest.raises(ValueError):
+        iat.stream_url({'upstream': 'http://valid.example', 'stream_upstream': 'file:///private'})
+    with pytest.raises(ValueError):
+        iat.stream_url({'upstream': 'https://user:password@vm.example'})
+    with pytest.raises(ValueError):
+        iat.stream_url({'upstream': 'file:///private'})
+    health = iat.health()
+    assert health['streaming_implemented'] is True
+    assert health['native_health_verified'] is False
+    assert health['recording_archive'] is False
+
+
 @pytest.fixture
 def configured(tmp_path,monkeypatch):
     subprocess.run([sys.executable,'scripts/init_config.py','--data-dir',str(tmp_path),'--upstream','http://upstream.invalid:8765'],check=True,capture_output=True)
@@ -64,7 +83,7 @@ def test_hmac_handshake_rejects_invalid_auth(configured,case):
                 pass
 
 
-def test_websocket_buffers_pcm_and_returns_final_result(configured,monkeypatch):
+def test_compatibility_pcm_buffers_and_returns_final_result(configured,monkeypatch):
     config,_=configured
     requests=[]
     original=httpx.AsyncClient
@@ -76,7 +95,7 @@ def test_websocket_buffers_pcm_and_returns_final_result(configured,monkeypatch):
     monkeypatch.setattr(iat.httpx,'AsyncClient',lambda **kwargs:original(transport=httpx.MockTransport(transport),**kwargs))
     with TestClient(iat.app) as client:
         with client.websocket_connect(sign(config)) as ws:
-            ws.send_json(first_frame(config))
+            ws.send_json(first_frame(config,sample_rate=8000))
             assert ws.receive_json()['header']['status']==0
             assert requests==[]
             ws.send_json({'header':{'status':2},'payload':{'audio':{'seq':2,'status':2,'audio':''}}})

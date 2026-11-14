@@ -4,6 +4,8 @@
 
 默认 `WETYPE_DATA_DIR=./data`，配置为该目录的 `config.json`。systemd 示例使用 `/var/lib/wetype-asr`。可通过 `WETYPE_CONFIG` 指定单独路径。不要把生成的配置、console token、key 文件加入 Git。
 
+`upstream` 保留原 HTTP 文件转写地址；默认也作为实时 Windows bridge 地址。如果旧部署的 `upstream` 是另一个不支持 WebSocket 的 HTTP 包装器，可额外设置私有 `stream_upstream` 为真正 bridge 的 HTTP/HTTPS 根地址，仅覆盖实时目标。详见 [流式适配](streaming.md)。
+
 `allowed_console_origins` 必须精确列出你用于管理的 origin（含非默认端口，不带路径）。例如本机 `http://127.0.0.1:18080`，或你自己的局域网管理入口。管理变更需要登录 cookie/令牌、匹配的 Host 与 Origin，以及动态 `X-Console-Action`，不能把公网页面设为控制台入口。
 
 ## systemd

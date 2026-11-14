@@ -1,5 +1,7 @@
 # WeType ASR Gateway
 
+**v0.2.0：真实流式识别。** 配套 Windows bridge 0.3.4 与 Linux 网关已完成 WeType 3.0.0.38 的服务器及 CAM 真人验收，支持录音期间更新草稿。见 [Release](https://github.com/h9647123/wetype-asr-gateway/releases/tag/v0.2.0)、[验收范围](docs/acceptance-20261114.md)与[升级说明](docs/streaming.md)。
+
 把 Windows 微信输入法的语音识别，通过 Ubuntu 网关接成文件 ASR 和讯飞 V2 风格的 WebSocket 接口，并提供局域网运维控制台。
 
 本项目是部署与协议适配层。实际微信语音桥接由 [kuxiaowo/wechat-asr-bridge](https://github.com/kuxiaowo/wechat-asr-bridge) 提供，**不是本项目自行实现的识别引擎**。识别需要腾讯云连接，不是离线模型，也不需要讯飞云账户。
@@ -8,14 +10,16 @@
 
 - 保留 `POST /api/asr`：multipart 文件和 JSON base64 上传。
 - 通过 Nginx 暴露上游 OpenAI 风格的 `/v1/models`、`/v1/audio/transcriptions`，模型为 `wetype-voice`。
-- `WS /v1`：讯飞 V2 风格 HMAC-SHA256 鉴权、0/1/2 分段音频和 base64 编码结果。
+- `WS /v1`：讯飞 V2 风格 HMAC-SHA256 鉴权、0/1/2 分段音频和 base64 编码结果；16 kHz / 单声道 / 16 bit PCM 可在录音结束前收到可修订的实时全文草稿。
 - 局域网控制台：API key 权限和用量、默认隐藏凭据、自动健康检查、失败详情、可选的 ASR / Search 重启按钮。
 - 配套 Windows SYSTEM 开机任务、Linux systemd / Nginx 示例，现有博客首页可以保留。
 - 可选 Bing RSS Search wrapper，输出 Tavily 风格 JSON；它不是 Tavily 官方服务或 SearXNG。
 
 ## 能力边界
 
-WebSocket **先缓存音频，结束后返回一次最终全文**，没有实时逐字结果、动态修正、热词、说话人分离或精确时间戳。仅支持 raw PCM：8/16 kHz，1/2 声道，8/16 bit，最长 60 秒；不支持 MP3/lame。OpenAI 文件接口由上游负责解码，最大 25 MiB。
+**v0.2.0 的实时路径需要配套 stream-capable Windows portable bridge 0.3.4**，不能只升级 Linux 网关后继续使用未扩展的上游 0.3.3。扩展源码及可复现来源随本项目提供，安装与现有部署升级见 [Windows 说明](docs/windows.md) 和 [流式适配](docs/streaming.md)。
+
+16 kHz / 单声道 / 16 bit raw PCM 通过双向 WebSocket 边传边识别，中间结果是可替换的整段草稿，最终结果以原生结束标记确认；不保证每个字或每个音频包都返回文字。其他受支持的 PCM 格式仍缓存完整音频后使用 HTTP 转写。总音频最长 60 秒，包含录音尾音；不支持 MP3/lame、热词、说话人分离或精确时间戳。OpenAI 文件接口和旧 `/api/asr` 保留，由上游解码，最大 25 MiB。公开版**不写入录音归档**，音频和诊断帧时刻仅在请求内存中保留。
 
 语言和口音参数不能强制切换 WeType 识别行为。上游依赖内部接口，升级可能失效。下面列出的实测版本与结果只是验收记录，不是对其他版本或识别准确率的保证。
 
@@ -26,7 +30,7 @@ flowchart LR
     N --> I[讯飞格式适配器]
     N --> B[Windows WeChatASRBridge]
     L --> B
-    I --> B
+    I -->|PCM + snapshot 双向 WS| B
     B --> W[WeType 语音接口]
     W --> T[腾讯云识别]
 ```
@@ -82,6 +86,9 @@ curl https://asr.example.com/api/asr \
 
 # 讯飞格式示例，读取本机私有 config.json，不打印密钥或签名 URL
 .venv/bin/python scripts/iat_client.py recording.wav data/config.json
+
+# 模拟实时音频，并显示变化中的整段草稿（会输出识别文本）
+.venv/bin/python scripts/iat_client.py recording.wav data/config.json --realtime --partials
 ```
 
 公网初始化可添加 `--public-base https://asr.example.com`。已有配置应在备份后编辑 `legacy_url`、`openai_base_url`、`iat_url`，不要重新生成 key。后端 `upstream` 仍为私有 VM 地址，不应绕到公网。
@@ -92,7 +99,7 @@ curl https://asr.example.com/api/asr \
 
 | 来源 | 本项目中的作用 | 许可证 / 说明 |
 |---|---|---|
-| [kuxiaowo/wechat-asr-bridge](https://github.com/kuxiaowo/wechat-asr-bridge) | **实际 ASR 后端**：Windows portable bridge、OpenAI 风格文件接口、WeType 语音桥接；本仓库提供外围部署与协议适配 | MIT；实测 v0.3.3，调研提交 `bce9b6b4825e6fb8c7a9d0d02a0d31a90dd3d2f2`；不打包其二进制 |
+| [kuxiaowo/wechat-asr-bridge](https://github.com/kuxiaowo/wechat-asr-bridge) | **实际 ASR 后端**：Windows portable bridge、OpenAI 风格文件接口、WeType 语音桥接；本仓库提供外围部署、流式扩展及协议适配 | MIT；原型 v0.3.3，研究基线提交 `bce9b6b4825e6fb8c7a9d0d02a0d31a90dd3d2f2`；配套发行版提供自建扩展 portable，保留上游归属，不含腾讯组件 |
 | [yu1745/wetype-ime-linux](https://github.com/yu1745/wetype-ime-linux) | Linux 微信输入法可行性调研参考；**不作为本项目运行依赖，没有复制其实现** | GPL-3.0；调研提交 `3a127ef2cb5a9d9754e6307f462b188d8f31b878` |
 | [讯飞实时语音转写 V2 文档](https://www.xfyun.cn/doc/spark/spark_zh_iat_new.html) | HMAC 签名和 WebSocket 数据格式参考 | 本地只实现列出的协议子集；无讯飞云凭据、账户或额度依赖 |
 | [modelscope/FunASR](https://github.com/modelscope/FunASR/blob/main/README_zh.md) | 官方文档列出的公开中文示例音频，用于公网验收 | 仅引用来源和测试结果，不打包模型、音频或 FunASR 源码 |
@@ -110,6 +117,8 @@ curl https://asr.example.com/api/asr \
 - 不公开部署日志、实际域名、IP、凭据、截图或虚拟机镜像。
 
 本仓库将原型配置参数化，并收紧可选重启权限。离线自动化测试不调用腾讯云；真实环境结果与 CI 测试范围分开记录，见 [验证说明](docs/verification.md)。
+
+本轮流式研究另在本机 WeType 3.0.1.35 上以公开预录音验证：500ms 分包、持续 encoder、录音结束前的中间文字与最终结束确认。它不代表任意版本、真人麦克风、所有公网条件或60秒录音已完成验收；现有 VM 版本不因升级网关而自动更换。
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt

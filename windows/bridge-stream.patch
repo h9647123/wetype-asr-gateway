@@ -1,0 +1,824 @@
+diff --git a/desktop_service.py b/desktop_service.py
+index 76990055f38c86956e817e1af90434b7ce9e5c38..af7f92f7c02dab665e1d57449250b53493001368 100644
+--- a/desktop_service.py
++++ b/desktop_service.py
+@@ -16,7 +16,7 @@ from desktop_settings import saved_port, save_port, saved_api_key, save_settings
+ from bridge_config import BRIDGE_ID, validate_concurrency
+ 
+ APP_BACKEND = BRIDGE_ID
+-VERSION = '0.3.3'
++VERSION = '0.3.4'
+ MAX_UPLOAD = 25 * 1024 * 1024
+ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+ 
+diff --git a/packaging/build_portable.py b/packaging/build_portable.py
+index e67bbefc4fefda158dbca446b01c6a2f4ec72dc1..d59877a064dbec11570a36661c25664ab7b4c94c 100644
+--- a/packaging/build_portable.py
++++ b/packaging/build_portable.py
+@@ -34,7 +34,7 @@ def notices(folder):
+              'No Weixin binaries or account data are included.', '']
+     packages = ['frida', 'fastapi', 'starlette', 'uvicorn', 'anyio', 'imageio-ffmpeg',
+                 'httpx', 'httpcore', 'h11', 'pydantic', 'pydantic-core', 'python-multipart',
+-                'certifi', 'idna', 'typing-extensions', 'openai', 'pyinstaller', 'pystray', 'Pillow', 'six', 'websocket-client']
++                'certifi', 'idna', 'typing-extensions', 'openai', 'pyinstaller', 'pystray', 'Pillow', 'six', 'websocket-client', 'websockets']
+     for name in packages:
+         distribution = importlib.metadata.distribution(name)
+         lines.append(f'{distribution.metadata["Name"]} {distribution.version}')
+diff --git a/packaging/portable.spec b/packaging/portable.spec
+index 9173bf39c163c2b71e56756b3a29cf0535828062..2b063515d27d8aec4850a6459e18d46cee94eed3 100644
+--- a/packaging/portable.spec
++++ b/packaging/portable.spec
+@@ -16,7 +16,7 @@ datas = [(str(root / 'agent.js'), '.'),
+ datas += collect_data_files('frida')
+ a = Analysis([str(root / 'desktop.py')], pathex=[str(root)],
+              binaries=[(str(ffmpeg), 'imageio_ffmpeg/binaries')], datas=datas,
+-             hiddenimports=collect_submodules('uvicorn') + ['pystray._win32'],
++             hiddenimports=collect_submodules('uvicorn') + collect_submodules('websockets') + ['pystray._win32'],
+              excludes=['pytest', 'unittest', 'IPython', 'numpy', 'matplotlib',
+                        'pystray._darwin', 'pystray._gtk', 'pystray._appindicator', 'pystray._xorg'],
+              noarchive=False)
+diff --git a/requirements.txt b/requirements.txt
+index 21ce02f8cfc714f26cb7406bd37c1b17eb3e9180..df93baa1210d22087479ebd9b1746271ce6c4496 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -9,3 +9,4 @@ httpx==0.28.1
+ pystray==0.19.5
+ Pillow==12.3.0
+ websocket-client==1.8.0
++websockets==17.3
+diff --git a/server.py b/server.py
+index 6698f88a39494053f21108b78e2cea7851028836..c97cfcce44fac3216f44a3d3f4cbebe0bb97d31e 100644
+--- a/server.py
++++ b/server.py
+@@ -1,5 +1,7 @@
+ """Local ASR bridge with independent WeChat, WeType and Doubao routes."""
+ import argparse
++import asyncio
++from contextlib import asynccontextmanager
+ import hmac
+ import json
+ import logging
+@@ -11,7 +13,7 @@ import threading
+ from pathlib import Path
+ 
+ import anyio
+-from fastapi import FastAPI, Request
++from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
+ from starlette.datastructures import UploadFile
+@@ -28,12 +30,57 @@ log = logging.getLogger(__name__)
+ 
+ MODELS = ('wechat-voice',)
+ MODEL_CREATED = int(time.time())
+-app = FastAPI(title='ASR Bridge', version='0.3.3', docs_url=None, redoc_url=None)
++app = FastAPI(title='ASR Bridge', version='0.3.4', docs_url=None, redoc_url=None)
+ backend = WechatBackend()
+ MAX_CONCURRENCY = 4
+ gate = anyio.Semaphore(MAX_CONCURRENCY)
+ worker_limit = anyio.CapacityLimiter(MAX_CONCURRENCY)
+ pools = None
++class WetypeAdmission:
++    """Preserve HTTP concurrency; a live encoder needs exclusive ownership."""
++    def __init__(self):
++        self.condition = anyio.Condition()
++        self.http_active = 0
++        self.stream_active = False
++
++    @asynccontextmanager
++    async def http(self):
++        async with self.condition:
++            while self.stream_active:
++                await self.condition.wait()
++            self.http_active += 1
++        try:
++            yield
++        finally:
++            with anyio.CancelScope(shield=True):
++                async with self.condition:
++                    self.http_active -= 1
++                    self.condition.notify_all()
++
++    def try_stream(self):
++        # ASGI handlers run on one event loop. No await between check and set.
++        if self.http_active or self.stream_active:
++            raise anyio.WouldBlock
++        self.stream_active = True
++
++    async def release_stream(self):
++        with anyio.CancelScope(shield=True):
++            async with self.condition:
++                self.stream_active = False
++                self.condition.notify_all()
++
++
++wetype_native_gate = WetypeAdmission()
++
++
++@asynccontextmanager
++async def native_admission(selected):
++    # Stream encoder/voice ownership must not overlap multipart WeType work.
++    if getattr(selected, 'model_owner', None) == 'wetype-local':
++        async with wetype_native_gate.http():
++            yield
++    else:
++        yield
+ 
+ 
+ @app.get('/docs', include_in_schema=False)
+@@ -147,6 +194,8 @@ async def health():
+                 'max_concurrency': sum(s['max_concurrency'] for s in states),
+                 'busy': any(s['active_requests'] for s in states), 'pools': states,
+                 'formats': ['json', 'text'], 'max_audio_seconds': None,
++                'streaming_results': 'wetype' in pools,
++                'stream_max_audio_seconds': 60 if 'wetype' in pools else None,
+                 'last_error': next((s['last_error'] for s in states if s['last_error']), None),
+                 'last_error_detail': next((s['last_error_detail'] for s in states if s['last_error_detail']), None),
+                 'warnings': [warning for state in states for warning in state['warnings']],
+@@ -159,6 +208,8 @@ async def health():
+             'agent_generation': backend.agent_generation,
+             'backend': getattr(backend, 'backend_id', 'wechat-4.1.13.65'), 'formats': ['json', 'text'],
+             'max_audio_seconds': None, 'last_error': backend.last_error,
++            'streaming_results': getattr(backend, 'model_owner', None) == 'wetype-local',
++            'stream_max_audio_seconds': 60 if getattr(backend, 'model_owner', None) == 'wetype-local' else None,
+             'last_error_detail': getattr(backend, 'last_error_detail', None),
+             'warnings': list(getattr(backend, 'warnings', [])),
+             'completion': getattr(backend, 'last_completion', None),
+@@ -217,7 +268,7 @@ async def transcriptions(request: Request):
+             pool = pools[key]
+             selected, selected_gate, selected_workers = pool.backend, pool.admit(), pool.workers
+         request.state.asr_backend = selected
+-        async with selected_gate:
++        async with native_admission(selected), selected_gate:
+             with anyio.CancelScope(shield=True):
+                 result = await anyio.to_thread.run_sync(selected.transcribe, data, abandon_on_cancel=False, limiter=selected_workers)
+         headers = {'x-wechat-audio-seconds': str(result.duration), 'x-wechat-session-cleaned': 'true'}
+@@ -234,6 +285,146 @@ async def transcriptions(request: Request):
+         return JSONResponse(body, headers=headers)
+ 
+ 
++@app.websocket('/v1/audio/stream')
++async def audio_stream(websocket: WebSocket):
++    from wetype_stream import WetypeStream, MAX_PCM_BYTES
++    key = os.environ.get('WECHAT_API_KEY')
++    supplied = websocket.headers.get('authorization', '')
++    if key and not hmac.compare_digest(supplied.encode(), ('Bearer ' + key).encode()):
++        await websocket.close(code=1008, reason='invalid_api_key')
++        return
++    selected = pools['wetype'].backend if pools is not None and 'wetype' in pools else backend
++    if getattr(selected, 'model_owner', None) != 'wetype-local':
++        await websocket.close(code=1008, reason='wetype_unavailable')
++        return
++    # Refuse a concurrent native session instead of retaining unbounded audio
++    # while queued behind another recording or a multipart transcription.
++    try:
++        wetype_native_gate.try_stream()
++    except anyio.WouldBlock:
++        await websocket.accept()
++        await websocket.send_json({'type': 'error', 'code': 'backend_busy', 'message': '输入法识别服务忙。'})
++        await websocket.close(code=1013)
++        return
++    stream = WetypeStream(selected)
++    receiver = None
++    disconnected = asyncio.Event()
++    incoming = asyncio.Queue(maxsize=32)
++    pool = pools['wetype'] if pools is not None else None
++    selected_gate = pool.admit() if pool else gate
++    selected_workers = pool.workers if pool else worker_limit
++
++    async def receive_audio():
++        received = 0
++        ended = False
++        deadline = time.monotonic() + 150
++        try:
++            while True:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise BackendError('流式连接超过总时限。', 504, 'recognition_timeout')
++                message = await asyncio.wait_for(websocket.receive(), timeout=remaining if ended else min(15, remaining))
++                if message['type'] == 'websocket.disconnect':
++                    stream.cancel()
++                    disconnected.set()
++                    return
++                if message.get('bytes') is not None:
++                    if ended:
++                        raise BackendError('end 后不能继续上传音频。', 400, 'invalid_control')
++                    data = message['bytes']
++                    received += len(data)
++                    if not data or len(data) % 2 or len(data) > 32000:
++                        raise BackendError('每帧 PCM 须为偶数字节且不超过 32000 字节。', 400, 'invalid_audio')
++                    if received > MAX_PCM_BYTES:
++                        raise BackendError('音频（含尾音）不能超过 60 秒。', 413, 'audio_too_long')
++                    await asyncio.wait_for(incoming.put(('audio', data)), timeout=5)
++                else:
++                    text = message.get('text', '')
++                    if len(text) > 256:
++                        raise BackendError('控制消息过大。', 400, 'invalid_control')
++                    try:
++                        control = json.loads(text)
++                    except (ValueError, TypeError):
++                        raise BackendError('控制消息必须为 JSON。', 400, 'invalid_control')
++                    kind = control.get('type') if isinstance(control, dict) else None
++                    if kind == 'cancel':
++                        stream.cancel()
++                        disconnected.set()
++                        return
++                    if kind != 'end' or ended:
++                        raise BackendError('仅支持 end/cancel 控制消息。', 400, 'invalid_control')
++                    await asyncio.wait_for(incoming.put(('end', None)), timeout=5)
++                    ended = True
++        except asyncio.CancelledError:
++            raise
++        except Exception as error:
++            # No additional audio is accepted after an error. A separate error
++            # slot avoids deadlock if the bounded PCM queue is already full.
++            receive_audio.error = error
++            stream.cancel()
++            disconnected.set()
++
++    receive_audio.error = None
++    try:
++        await websocket.accept()
++        async with selected_gate:
++            with anyio.CancelScope(shield=True):
++                await anyio.to_thread.run_sync(stream.open, limiter=selected_workers)
++            await websocket.send_json({'type': 'ready', 'sample_rate': 16000, 'channels': 1,
++                                       'format': 's16le', 'max_audio_seconds': 60, 'batch_ms': 500})
++            receiver = asyncio.create_task(receive_audio())
++            while not disconnected.is_set():
++                try:
++                    kind, data = await asyncio.wait_for(incoming.get(), timeout=0.25)
++                except asyncio.TimeoutError:
++                    continue
++                action = stream.finish if kind == 'end' else lambda: stream.push(data)
++                with anyio.CancelScope(shield=True):
++                    snapshots = await anyio.to_thread.run_sync(action, limiter=selected_workers)
++                    if kind == 'end':
++                        # Do not advertise a completed request before native
++                        # ownership has been checked and encoder released.
++                        await anyio.to_thread.run_sync(stream.close, limiter=selected_workers)
++                if disconnected.is_set():
++                    break
++                for snapshot in snapshots:
++                    await asyncio.wait_for(websocket.send_json(snapshot), timeout=5)
++                if kind == 'end':
++                    break
++            if receive_audio.error:
++                raise receive_audio.error
++    except (WebSocketDisconnect, asyncio.CancelledError):
++        pass
++    except Exception as error:
++        selected.last_error = getattr(error, 'code', 'stream_failed')
++        try:
++            await asyncio.wait_for(websocket.send_json({'type': 'error',
++                'code': getattr(error, 'code', 'stream_failed'),
++                'message': str(error) if isinstance(error, BackendError) else '流式识别失败。'}), timeout=5)
++        except Exception:
++            pass
++    finally:
++        if receiver:
++            receiver.cancel()
++            try:
++                await receiver
++            except asyncio.CancelledError:
++                pass
++        try:
++            with anyio.CancelScope(shield=True):
++                await anyio.to_thread.run_sync(stream.close, limiter=selected_workers)
++        except BackendError as error:
++            # The socket may already be gone. Health records the quarantine;
++            # never unload native buffers simply to finish an ASGI request.
++            log.error('WeType stream cleanup uncertain: code=%s', error.code)
++        finally:
++            await wetype_native_gate.release_stream()
++        try:
++            await websocket.close()
++        except (RuntimeError, WebSocketDisconnect):
++            pass
++
++
+ def configure_backend(name, concurrency=None):
+     global backend, MODELS, MAX_CONCURRENCY, gate, pools, worker_limit
+     capacities = validate_concurrency(concurrency)
+diff --git a/tests/verify_wetype_agent.cjs b/tests/verify_wetype_agent.cjs
+index faca03059d4b8b8e932c95b01be0bb449560b43e..3dc87de43487e1813b1eb1f2b0fa8b755b00c06e 100644
+--- a/tests/verify_wetype_agent.cjs
++++ b/tests/verify_wetype_agent.cjs
+@@ -39,6 +39,14 @@ function respond(submission) {
+ vm.runInNewContext(fs.readFileSync(path.join(__dirname,'..','wetype_agent.js'),'utf8'),context);
+ const agent=context.rpc.exports;
+ (async()=>{
++ agent.streamOpen('encoder-A');
++ assert.equal(agent.stats().encoders,1);
++ assert.equal(agent.finalize('encoder-A').cleaned,false,'live encoder belongs to its owner');
++ assert.throws(()=>agent.streamOpen('encoder-A'),/owner/);
++ assert.throws(()=>agent.streamPush('other',[0,0]),/Invalid/);
++ assert.equal(agent.streamClose('encoder-A'),true);
++ assert.equal(agent.streamClose('encoder-A'),false,'closing an owner twice must be harmless');
++ assert.equal(agent.finalize('encoder-A').cleaned,true);
+  const a=agent.request([1], 'A'),b=agent.request([2], 'B');
+  assert.equal(agent.finalize().cleaned,false);
+  respond(submissions[0]);
+diff --git a/wetype_agent.js b/wetype_agent.js
+index fea561610049bdbfcae84b305d2c1a1d70d97139..3ebe0068e36901c7dd94ac8ce9da241a835c69cc 100644
+--- a/wetype_agent.js
++++ b/wetype_agent.js
+@@ -13,6 +13,7 @@ const business = Process.getModuleByName('wetap_business.dll');
+ const submit = new NativeFunction(business.getExportByName('business_net_start_task_with_option'),
+  'int', ['int','int','pointer','uint','pointer','pointer','pointer'], {abi:'win64', exceptions:'steal'});
+ const tasks = new Map();
++const streamingEncoders = new Map();
+ let closing = false;
+ let callbacks = 0;
+ const callback = new NativeCallback((user, taskId, code, response, length) => {
+@@ -35,6 +36,35 @@ const callback = new NativeCallback((user, taskId, code, response, length) => {
+ }, 'void', ['pointer','int','int','pointer','uint'], 'win64');
+ 
+ rpc.exports = {
++ streamOpen(owner) {
++  if (closing || !owner || streamingEncoders.has(owner)) throw Error('Invalid stream owner or agent stopping');
++  const object = Memory.alloc(0x28);
++  construct(object);
++  try {
++   const code = initialize(object, 16000, 1, 64000, 1);
++   if (code !== 0) throw Error('Opus initialization failed: ' + code);
++   streamingEncoders.set(owner, {object});
++  } catch (error) { release(object); throw error; }
++ },
++ streamPush(owner, pcm) {
++  const state = streamingEncoders.get(owner);
++  if (closing || !state || !pcm.length || pcm.length % 640) throw Error('Invalid stream PCM or agent stopping');
++  const input = Memory.alloc(pcm.length), capacity = pcm.length / 640 * 1502 + 16;
++  const output = Memory.alloc(capacity), length = Memory.alloc(4);
++  input.writeByteArray(pcm);
++  const code = encode(state.object, input, pcm.length, output, capacity, length);
++  if (code !== 0) throw Error('Opus encoding failed: ' + code);
++  const size = length.readU32();
++  if (size > capacity) throw Error('Invalid Opus output size');
++  return Array.from(new Uint8Array(output.readByteArray(size)));
++ },
++ streamClose(owner) {
++  const state = streamingEncoders.get(owner);
++  if (!state) return false;
++  release(state.object);
++  streamingEncoders.delete(owner);
++  return true;
++ },
+  encode(pcm) {
+   if (closing || pcm.length === 0 || pcm.length % 640 !== 0) throw Error('Invalid PCM or agent stopping');
+   const object = Memory.alloc(0x28), input = Memory.alloc(pcm.length);
+@@ -80,14 +110,14 @@ rpc.exports = {
+    }
+   });
+  },
+- stats() { return {pending:tasks.size, callbacks, closing}; },
++ stats() { return {pending:tasks.size, callbacks, closing, encoders:streamingEncoders.size}; },
+  finalize(owner) {
+   // A live task belonging to another audio must not quarantine this caller.
+-  return {cleaned: owner === undefined ? tasks.size === 0 && callbacks === 0 :
+-   !Array.from(tasks.values()).some(task => task.owner === owner)};
++  return {cleaned: owner === undefined ? tasks.size === 0 && callbacks === 0 && streamingEncoders.size === 0 :
++   !streamingEncoders.has(owner) && !Array.from(tasks.values()).some(task => task.owner === owner)};
+  },
+  dispose() {
+   closing = true;
+-  return {cleaned:tasks.size === 0 && callbacks === 0};
++  return {cleaned:tasks.size === 0 && callbacks === 0 && streamingEncoders.size === 0};
+  }
+ };
+diff --git a/wetype_stream.py b/wetype_stream.py
+new file mode 100644
+--- /dev/null
++++ b/wetype_stream.py
+@@ -0,0 +1,176 @@
++"""Bounded, persistent WeType PCM session. Native calls remain synchronous.
++
++The ASGI adapter supplies backpressure and runs each call off the event loop.
++One owner survives from encoder creation through the explicit server end flag.
++"""
++import os
++import struct
++import time
++import threading
++import uuid
++
++from backend import BackendError
++from diagnostics import exception_detail
++from wetype_backend import discover_pid
++from wetype_protocol import ProtocolError, request, response
++
++MAX_PCM_BYTES = 60 * 32000
++BATCH_BYTES = 16000  # 500 ms; longer than the native 250 ms callback guard.
++HEADER = b'#!OPUS_RAW_V1\x02\x01\x00'
++
++
++class WetypeStream:
++    def __init__(self, backend):
++        self.backend = backend
++        self.owner = 'wt-stream-' + uuid.uuid4().hex
++        self.script = self.session = None
++        self.registered = self.encoder_open = False
++        self.sequence = self.encoded_bytes = self.pcm_bytes = self.revision = 0
++        self.buffer = bytearray()
++        self.text = ''
++        self.started = time.monotonic()
++        self.finished = False
++        self.cancelled = threading.Event()
++
++    def cancel(self):
++        # Setting a flag never frees native callbacks owned by an in-flight RPC.
++        self.cancelled.set()
++
++    def open(self):
++        backend = self.backend
++        with backend.lock:
++            pid = backend._pid if backend.agent_connected and not os.environ.get('WETYPE_PID') else discover_pid()
++            if backend._closing:
++                raise BackendError('服务正在停止。', 503, 'server_stopping')
++            if backend._active_requests:
++                raise BackendError('输入法识别服务忙。', 503, 'backend_busy')
++            if backend._unsafe_pid is not None and pid != backend._unsafe_pid:
++                backend._unsafe_pid = None
++                backend.healthy = True
++            if pid == backend._unsafe_pid or not backend.healthy:
++                raise BackendError('输入法原生回调尚未清理。', 503, 'cleanup_failed')
++            self.script = backend._ensure_agent(pid)
++            self.session = backend._session
++            backend._active_requests += 1
++            self.registered = True
++        self.script.exports_sync.stream_open(self.owner)
++        self.encoder_open = True
++
++    def _submit(self, audio, sequence, end=False):
++        if self.cancelled.is_set():
++            raise BackendError('识别已取消。', 400, 'request_cancelled')
++        if time.monotonic() - self.started > 150:
++            raise BackendError('流式识别超过总时限。', 504, 'recognition_timeout')
++        payload = request(self.owner, audio, sequence, self.encoded_bytes, end=end)
++        reply = self.script.exports_sync.request(list(payload), self.owner)
++        if self.cancelled.is_set():
++            raise BackendError('识别已取消。', 400, 'request_cancelled')
++        if reply['code'] != 0:
++            raise BackendError('输入法语音网络请求失败。', 502, 'wetype_transport_error',
++                               details={'native_code': reply['code'], 'task_id': reply.get('taskId')})
++        return response(bytes(reply['data']), self.owner)
++
++    def _encode_submit(self, pcm):
++        encoded = bytes(self.script.exports_sync.stream_push(self.owner, list(pcm)))
++        offset = 16 if self.sequence == 0 else 0
++        if self.sequence == 0 and not encoded.startswith(HEADER):
++            raise ProtocolError('持续编码缺少首片流头。')
++        if self.sequence and encoded.startswith(HEADER):
++            raise ProtocolError('持续编码意外重置。')
++        frames = 0
++        while offset < len(encoded):
++            if offset + 2 > len(encoded):
++                raise ProtocolError('持续编码帧长度不完整。')
++            size = struct.unpack_from('<H', encoded, offset)[0]
++            offset += size + 2
++            if not 0 < size <= 1500 or offset > len(encoded):
++                raise ProtocolError('持续编码帧不完整。')
++            frames += 1
++        if frames != len(pcm) // 640:
++            raise ProtocolError('持续编码帧数与 PCM 不一致。')
++        self.sequence += 1
++        self.encoded_bytes += len(encoded)
++        current = self._submit(encoded, self.sequence)
++        if current.end_flag:
++            raise BackendError('输入法在音频结束前提前关闭识别，未交付可能截断的文字。',
++                               502, 'premature_completion')
++        return current
++
++    def _snapshot(self, current, *, final=False):
++        # Empty ACKs are not text erasures. Final text remains authoritative.
++        if not final and (not current.text or current.text == self.text):
++            return None
++        self.text = current.text
++        self.revision += 1
++        return {'type': 'snapshot', 'revision': self.revision, 'text': self.text, 'final': final}
++
++    def push(self, pcm):
++        if self.finished or not pcm or len(pcm) % 2:
++            raise BackendError('PCM 必须为非空 s16le 数据。', 400, 'invalid_audio')
++        if self.pcm_bytes + len(pcm) > MAX_PCM_BYTES:
++            raise BackendError('音频（含尾音）不能超过 60 秒。', 413, 'audio_too_long')
++        self.pcm_bytes += len(pcm)
++        self.buffer.extend(pcm)
++        results = []
++        while len(self.buffer) >= BATCH_BYTES:
++            batch = bytes(self.buffer[:BATCH_BYTES])
++            del self.buffer[:BATCH_BYTES]
++            item = self._snapshot(self._encode_submit(batch))
++            if item:
++                results.append(item)
++        return results
++
++    def finish(self):
++        if self.finished or not self.pcm_bytes:
++            raise BackendError('没有可识别的音频。', 400, 'empty_audio')
++        results = []
++        if self.buffer:
++            self.buffer.extend(b'\0' * (-len(self.buffer) % 640))
++            item = self._snapshot(self._encode_submit(bytes(self.buffer)))
++            self.buffer.clear()
++            if item:
++                results.append(item)
++        self.sequence += 1
++        deadline = time.monotonic() + 40
++        current = self._submit(b'', self.sequence, True)
++        while not current.end_flag:
++            item = self._snapshot(current)
++            if item:
++                # The caller is waiting on finalization. Retain only the last
++                # intermediate snapshot instead of growing a full-text list.
++                results[:] = [item]
++            if time.monotonic() >= deadline:
++                raise BackendError('输入法未确认识别结束。', 504, 'recognition_timeout')
++            if self.cancelled.wait(max(0.1, min(current.interval_ms / 1000, 1))):
++                raise BackendError('识别已取消。', 400, 'request_cancelled')
++            current = self._submit(b'', 0, True)
++        self.finished = True
++        results.append(self._snapshot(current, final=True))
++        with self.backend.lock:
++            self.backend.last_success = time.time()
++            self.backend.last_completion = 'server_end_flag'
++            self.backend.last_error = self.backend.last_error_detail = None
++        return results
++
++    def close(self):
++        if not self.registered:
++            return
++        cleanup = {'cleaned': bool(self.session.is_detached)}
++        try:
++            if not self.session.is_detached:
++                if self.encoder_open:
++                    self.script.exports_sync.stream_close(self.owner)
++                    self.encoder_open = False
++                cleanup = self.script.exports_sync.finalize(self.owner)
++        except Exception as error:
++            cleanup = {'cleaned': bool(self.session.is_detached), 'error': exception_detail(error)}
++        finally:
++            with self.backend.lock:
++                if not cleanup.get('cleaned'):
++                    self.backend.healthy = False
++                    self.backend.last_error = 'cleanup_failed'
++                self.backend._active_requests -= 1
++                self.backend.lock.notify_all()
++                self.registered = False
++        if not cleanup.get('cleaned'):
++            raise BackendError('原生回调未清理，已暂停后续调用。', 503, 'cleanup_failed')
+diff --git a/tests/test_wetype_stream.py b/tests/test_wetype_stream.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_wetype_stream.py
+@@ -0,0 +1,215 @@
++"""Transport and native-session tests; no process injection or microphone use."""
++import os
++import struct
++import threading
++import unittest
++from unittest.mock import MagicMock, patch
++
++from fastapi.testclient import TestClient
++from starlette.websockets import WebSocketDisconnect
++
++import server
++from backend import BackendError
++from wetype_backend import WetypeBackend, WetypeTranscription
++from wetype_protocol import blob, integer, fields, value
++from wetype_stream import WetypeStream, HEADER, MAX_PCM_BYTES
++
++
++def answer(owner, text, final=False):
++    return {'code': 0, 'data': list(blob(1, blob(1, integer(1, 0)) + blob(2, owner.encode())
++        + blob(4, text.encode()) + integer(5, int(final))))}
++
++
++class NativeStreamTests(unittest.TestCase):
++    def setUp(self):
++        self.backend = WetypeBackend()
++        self.script = MagicMock()
++        self.session = MagicMock(is_detached=False)
++        self.backend._ensure_agent = MagicMock(return_value=self.script)
++        self.backend._session = self.session
++        self.backend._pid = 123
++        self.script.exports_sync.finalize.return_value = {'cleaned': True}
++        self.stream = WetypeStream(self.backend)
++        self.encoder_calls = 0
++
++        def encode(owner, pcm):
++            self.encoder_calls += 1
++            prefix = HEADER if self.encoder_calls == 1 else b''
++            return list(prefix + (struct.pack('<H', 1) + b'a') * (len(pcm) // 640))
++
++        def submit(data, owner):
++            inner = fields(value(fields(bytes(data)), 1, 2, None))
++            final = bool(value(inner, 6, 0, 0))
++            return answer(owner, '完整结果' if final else '中间文字', final)
++
++        self.script.exports_sync.stream_push.side_effect = encode
++        self.script.exports_sync.request.side_effect = submit
++
++    def test_persistent_encoder_padding_final_flag_and_cleanup(self):
++        with patch('wetype_stream.discover_pid', return_value=123):
++            self.stream.open()
++        first = self.stream.push(b'\0' * 16000)
++        self.assertEqual(first[0]['text'], '中间文字')
++        self.assertFalse(first[0]['final'])
++        self.assertEqual(self.stream.push(b'\0' * 2), [])
++        final = self.stream.finish()
++        self.assertTrue(final[-1]['final'])
++        self.assertEqual(final[-1]['text'], '完整结果')
++        self.stream.close()
++        self.stream.close()
++        self.script.exports_sync.stream_open.assert_called_once()
++        self.script.exports_sync.stream_close.assert_called_once()
++        self.assertEqual(self.backend._active_requests, 0)
++        self.assertEqual(self.encoder_calls, 2)
++
++    def test_over_limit_does_not_encode_or_mutate_count(self):
++        self.stream.pcm_bytes = MAX_PCM_BYTES
++        with self.assertRaises(BackendError) as result:
++            self.stream.push(b'\0\0')
++        self.assertEqual(result.exception.code, 'audio_too_long')
++        self.script.exports_sync.stream_push.assert_not_called()
++
++    def test_cleanup_uncertain_quarantines_backend(self):
++        with patch('wetype_stream.discover_pid', return_value=123):
++            self.stream.open()
++        self.script.exports_sync.finalize.return_value = {'cleaned': False}
++        with self.assertRaises(BackendError):
++            self.stream.close()
++        self.assertFalse(self.backend.healthy)
++        self.assertEqual(self.backend._active_requests, 0)
++        self.script.unload.assert_not_called()
++        self.session.detach.assert_not_called()
++
++    def test_premature_native_end_flag_rejected(self):
++        with patch('wetype_stream.discover_pid', return_value=123):
++            self.stream.open()
++        self.script.exports_sync.request.side_effect = lambda data, owner: answer(owner, '截断', True)
++        with self.assertRaises(BackendError) as result:
++            self.stream.push(b'\0' * 16000)
++        self.assertEqual(result.exception.code, 'premature_completion')
++        self.stream.close()
++
++    def test_cancel_prevents_another_native_submit_and_still_cleans(self):
++        with patch('wetype_stream.discover_pid', return_value=123):
++            self.stream.open()
++        self.stream.push(b'\0' * 16000)
++        before = self.script.exports_sync.request.call_count
++        self.stream.cancel()
++        with self.assertRaises(BackendError) as result:
++            self.stream.finish()
++        self.assertEqual(result.exception.code, 'request_cancelled')
++        self.assertEqual(self.script.exports_sync.request.call_count, before)
++        self.stream.close()
++
++    def test_ack_without_end_flag_does_not_finish(self):
++        with patch('wetype_stream.discover_pid', return_value=123):
++            self.stream.open()
++        self.stream.push(b'\0' * 16000)
++        self.script.exports_sync.request.return_value = answer(self.stream.owner, '稳定但未确认')
++        self.script.exports_sync.request.side_effect = None
++        with patch('wetype_stream.time.monotonic', side_effect=[10, 11, 60]), patch('wetype_stream.time.sleep'):
++            with self.assertRaises(BackendError) as result:
++                self.stream.finish()
++        self.assertEqual(result.exception.code, 'recognition_timeout')
++        self.assertFalse(self.stream.finished)
++        self.stream.close()
++
++
++class WebSocketTests(unittest.TestCase):
++    def setUp(self):
++        server.configure_backend('wetype')
++        self.client = TestClient(server.app)
++        self.client.__enter__()
++        self.native = MagicMock()
++        self.native.push.return_value = [{'type': 'snapshot', 'revision': 1, 'text': '测试', 'final': False}]
++        self.native.finish.return_value = [{'type': 'snapshot', 'revision': 2, 'text': '测试完成', 'final': True}]
++        self.patch = patch('wetype_stream.WetypeStream', return_value=self.native)
++        self.patch.start()
++        self.env = patch.dict(os.environ, {'WECHAT_API_KEY': 'fixture-test-key'})
++        self.env.start()
++
++    def tearDown(self):
++        self.client.__exit__(None, None, None)
++        self.patch.stop()
++        self.env.stop()
++        server.configure_backend('all')
++
++    def connect(self):
++        return self.client.websocket_connect('/v1/audio/stream', headers={'authorization': 'Bearer fixture-test-key'})
++
++    def test_auth_rejects_missing_key_without_opening_encoder(self):
++        with self.assertRaises(WebSocketDisconnect):
++            with self.client.websocket_connect('/v1/audio/stream'):
++                pass
++        self.native.open.assert_not_called()
++
++    def test_partial_before_end_and_final_after_cleanup(self):
++        with self.connect() as ws:
++            self.assertEqual(ws.receive_json()['type'], 'ready')
++            ws.send_bytes(b'\0' * 16000)
++            self.assertFalse(ws.receive_json()['final'])
++            ws.send_json({'type': 'end'})
++            self.assertTrue(ws.receive_json()['final'])
++            self.assertTrue(self.native.close.called)
++        self.native.open.assert_called_once()
++
++    def test_invalid_pcm_then_next_request_can_enter(self):
++        with self.connect() as ws:
++            ws.receive_json()
++            ws.send_bytes(b'x')
++            self.assertEqual(ws.receive_json()['code'], 'invalid_audio')
++        with self.connect() as ws:
++            self.assertEqual(ws.receive_json()['type'], 'ready')
++            ws.send_json({'type': 'cancel'})
++
++    def test_competing_stream_refused_before_encoder_open(self):
++        with self.connect() as first:
++            first.receive_json()
++            with self.connect() as second:
++                self.assertEqual(second.receive_json()['code'], 'backend_busy')
++            self.native.open.assert_called_once()
++            first.send_json({'type': 'cancel'})
++
++    def test_http_cannot_steal_live_stream_backend(self):
++        called = threading.Event()
++        completed = threading.Event()
++        replies = []
++        def transcribe(data):
++            called.set()
++            return WetypeTranscription('HTTP结果', 1, 123, 50, 100, 'server_end_flag')
++        def post():
++            replies.append(self.client.post('/v1/audio/transcriptions',
++                headers={'authorization': 'Bearer fixture-test-key'}, data={'model': 'wetype-voice'},
++                files={'file': ('fixture.wav', b'fixture')}))
++            completed.set()
++        with patch.object(server.backend, 'transcribe', side_effect=transcribe):
++            with self.connect() as ws:
++                ws.receive_json()
++                thread = threading.Thread(target=post, daemon=True)
++                thread.start()
++                self.assertFalse(called.wait(0.15))
++                ws.send_json({'type': 'cancel'})
++            self.assertTrue(completed.wait(3))
++            thread.join(1)
++        self.assertEqual(replies[0].status_code, 200)
++
++    def test_cancel_after_end_stops_final_polling(self):
++        started, cancelled, stopped = threading.Event(), threading.Event(), threading.Event()
++        def finish():
++            started.set()
++            if not cancelled.wait(2):
++                raise AssertionError('end must keep monitoring cancel')
++            stopped.set()
++            raise BackendError('识别已取消。', 400, 'request_cancelled')
++        self.native.finish.side_effect = finish
++        self.native.cancel.side_effect = cancelled.set
++        with self.connect() as ws:
++            ws.receive_json()
++            ws.send_json({'type': 'end'})
++            self.assertTrue(started.wait(1))
++            ws.send_json({'type': 'cancel'})
++            self.assertTrue(stopped.wait(1))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/docs/WETYPE-STREAM.md b/docs/WETYPE-STREAM.md
+new file mode 100644
+--- /dev/null
++++ b/docs/WETYPE-STREAM.md
+@@ -0,0 +1,30 @@
++# WeType 实时 PCM WebSocket
++
++新增独立 `/v1/audio/stream`，原 `/v1/audio/transcriptions` multipart 参数与行为保持不变。
++必须使用配置好的 Bearer Key；不要把 Key 放进 URL 或日志。仅启用 `wetype` 或 `all` 后端时提供此接口。
++
++1. 客户端发起 WebSocket，并带 `Authorization: Bearer ...`。
++2. 等待 `{"type":"ready","sample_rate":16000,"channels":1,"format":"s16le","max_audio_seconds":60,"batch_ms":500}`。
++3. 发送原始 16kHz、单声道、signed 16-bit little-endian PCM 二进制帧。每帧非空、偶数字节且不超过 32000 字节。建议每 200–500ms 上传，持续录音时不要等待文字才继续上传。
++4. 每次收到 `{"type":"snapshot","revision":1,"text":"当前全文","final":false}`，替换本次识别草稿，不要重复追加。
++5. 停录后发送 `{"type":"end"}`；必须等 `final:true` 才提交最终识别结果。空音频返回 `empty_audio`；合法音频识别为空时最终文字可为空。
++6. `{"type":"cancel"}` 或断线停止接受后续音频，清理本轮编码器；已进入原生层的调用仍等待回调保护完成，不能强制卸载 agent。
++
++`{"type":"error","code":"...","message":"..."}` 是本轮失败，随后关闭连接。不得把中间草稿冒充最终结果。
++Key 错误在升级握手前以策略拒绝。已有 WeType 请求运行时新流返回 `backend_busy`；multipart 请求会等待流释放原生使用权。
++
++音频总量上限 60 秒，包含板端尾音；15 秒无上传/控制消息超时，连接总时限 150 秒。输入队列最多 32 帧、单帧 32000 字节，队列等待超过 5 秒结束本轮。原生任务已有 15 秒 callback 超时，超时后仍保留所有权，若 finalize 无法确认清理会暂停新的原生请求。
++
++持续编码使用同一 native encoder/owner；500ms 批次保留已有 250ms 原生回调安全延迟。最终结果必须收到 WeType `end_flag`，并成功释放 encoder、核实本轮 callback 清理，才向客户端发送 `final:true`。
++
++这只是桥接端实时能力。板端必须在采音期间上传并显示中间快照；Linux XFYUN 兼容网关也必须把 PCM 转发到此接口，而不是在 status=2 后才提交 WAV。
++
++运行依赖新增 `websockets==17.3`。Windows portable 构建：
++
++```powershell
++& <Python环境>/python.exe -m pip install -r requirements.txt -r requirements-build.txt
++& <Python环境>/python.exe -m unittest tests.test_wetype_stream tests.test_wetype -q
++& <Python环境>/python.exe packaging/build_portable.py
++```
++
++单元测试不会注入 WeType 或读取麦克风。必须另外在实际部署版本上完成真实音频、取消后恢复、原接口回归和板端语音验收；HTTP 101/200 与 mock 不等于真实识别通过。

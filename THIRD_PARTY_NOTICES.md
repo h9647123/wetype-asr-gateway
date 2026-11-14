@@ -6,7 +6,7 @@
 - 作者 / MIT 版权所有声明：Copyright (c) 2026 kuxiaowo。
 - 调研提交：`bce9b6b4825e6fb8c7a9d0d02a0d31a90dd3d2f2`，实际使用 portable v0.3.3。
 - 语音桥接和 OpenAI 风格上游服务由该项目实现。本仓库的贡献是部署整合、原接口适配、讯飞风格协议转换和管理控制台，不将其成果归为自研识别引擎。
-- 本仓库不打包其源码或二进制。若自行重新分发上游软件，应保留上游 MIT 许可证和声明。许可证原文：<https://github.com/kuxiaowo/wechat-asr-bridge/blob/main/LICENSE>。
+- v0.2.0 在 `windows/bridge-stream.patch` 提供针对上述固定提交的10文件修改，包含源代码片段、新增流式模块、测试及构建调整。配套发行版可包含本项目自建的 stream-capable portable 0.3.4，并非上游官方版本；保留上游 MIT 版权、许可证及其依赖声明。上游许可证副本见 `windows/UPSTREAM-BRIDGE-LICENSE.txt`，复现步骤见 `windows/STREAM-BRIDGE.md`。许可证原文：<https://github.com/kuxiaowo/wechat-asr-bridge/blob/main/LICENSE>。
 
 ## wetype-ime-linux — 调研参考
 
