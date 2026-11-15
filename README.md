@@ -1,5 +1,7 @@
 # WeType ASR Gateway
 
+**中文** | [English](README.en.md)
+
 **v0.2.0：真实流式识别。** 配套 Windows bridge 0.3.4 与 Linux 网关已完成 WeType 3.0.0.38 的服务器及 CAM 真人验收，支持录音期间更新草稿。见 [Release](https://github.com/h9647123/wetype-asr-gateway/releases/tag/v0.2.0)、[验收范围](docs/acceptance-20261114.md)与[升级说明](docs/streaming.md)。
 
 把 Windows 微信输入法的语音识别，通过 Ubuntu 网关接成文件 ASR 和讯飞 V2 风格的 WebSocket 接口，并提供局域网运维控制台。
